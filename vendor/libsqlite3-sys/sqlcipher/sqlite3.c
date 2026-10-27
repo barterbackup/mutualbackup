@@ -69581,9 +69581,37 @@ SQLITE_PRIVATE int sqlite3WalFrames(
   int isCommit,                   /* True if this is a commit */
   int sync_flags                  /* Flags to pass to OsSync() (or 0) */
 ){
-  int rc;
+  int rc = SQLITE_OK;
   SEH_TRY {
-    rc = walFrames(pWal, szPage, pList, nTruncate, isCommit, sync_flags);
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+    int mbAdmission = 0;
+    /* Opted-in native writers fund the future main before publishing a WAL
+    ** commit. Hold CKPT shared through publication so a concurrent checkpoint
+    ** cannot truncate that backing. The callback must not reenter SQLite or
+    ** change logical EOF. Unsupported VFSes retain their original lock path. */
+    if( isCommit ){
+      sqlite3_int64 nRequired = 0;
+      rc = sqlite3OsFileControl(pWal->pDbFd,
+          MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+3, &nRequired);
+      if( rc==SQLITE_OK ){
+        rc = walLockShared(pWal, WAL_CKPT_LOCK);
+        if( rc==SQLITE_OK ){
+          mbAdmission = 1;
+          nRequired = (sqlite3_int64)nTruncate * szPage;
+          rc = sqlite3OsFileControl(pWal->pDbFd,
+              MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD+3, &nRequired);
+        }
+      }else if( rc==SQLITE_NOTFOUND ){
+        rc = SQLITE_OK;
+      }
+    }
+#endif
+    if( rc==SQLITE_OK ){
+      rc = walFrames(pWal, szPage, pList, nTruncate, isCommit, sync_flags);
+    }
+#if defined(__linux__) && defined(MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD)
+    if( mbAdmission ) walUnlockShared(pWal, WAL_CKPT_LOCK);
+#endif
   }
   SEH_EXCEPT( rc = walHandleException(pWal); )
   return rc;

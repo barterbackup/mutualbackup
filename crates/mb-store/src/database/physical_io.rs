@@ -506,6 +506,28 @@ pub(super) struct Binding {
 }
 
 impl Binding {
+    pub(super) fn fund_main_commit(&self, bytes: u64) -> Result<(), DatabaseError> {
+        if self.role != Role::Main {
+            return Err(DatabaseError::PhysicalIoUnavailable);
+        }
+        self.fund(0, bytes)?;
+        if bytes != 0 {
+            // Persist the preallocated main extent before a WAL commit can
+            // rely on it. fdatasync need not preserve allocation beyond EOF.
+            loop {
+                if unsafe { libc::fsync(self.descriptor) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
+            }
+            self.refresh_after_io()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn initialize_main(&mut self) -> Result<(), DatabaseError> {
         if self.role != Role::Main || self.closed {
             return Err(DatabaseError::PhysicalIoUnavailable);
@@ -911,3 +933,6 @@ mod parity_tests;
 
 #[cfg(test)]
 mod extent_failure_tests;
+
+#[cfg(test)]
+mod wal_commit_tests;

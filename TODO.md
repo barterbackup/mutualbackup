@@ -3326,6 +3326,40 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Fund native main data before publishing a WAL commit.
+        A native WAL could commit a database larger than its immutable main
+        ceiling, or commit while readers blocked checkpointing with only 65,536
+        main bytes allocated for 1,134,592 database bytes. The pinned SQLite and
+        SQLCipher bundles now probe private main admission (1046), take CKPT
+        shared for participating writers, and admit the exact nTruncate*szPage
+        range before publishing frames. The Rust binding admits against original
+        role/combined/headroom limits, allocates and fsyncs private main extents
+        through the existing descriptor, and rechecks allocation without changing
+        logical EOF. The
+        checkpoint lock protects funded tails from concurrent truncation;
+        contention returns BUSY before funding. Unsupported VFSes retain their
+        original commit/lock path. No independent main descriptor is opened.
+        Four new cases cover whole-transaction refusal/rollback and healthy
+        retry/reopen, exact private backing with a pinned reader, checkpoint
+        contention and retry, and invalid arguments/legacy compatibility.
+        Both plain SQLite default/debug probes verify exact sizes, refusal,
+        retry, foreign behavior and checkpoint exclusion. Debug assertions caught
+        and corrected an early-return bookkeeping error; no assertion is disabled.
+        Full frozen Store passes 653 with 32 ignored in 711.44 seconds under the
+        original 900-second/four-worker/65,536-FD gate. All 108 volume cases pass
+        (eight ignored), the four new cases pass on owned Btrfs, and both native
+        control/parity and scratch headroom workflows pass. Strict workspace/
+        all-targets Clippy, formatting and shell/diff checks pass. The Linux
+        acceptance script now runs both bundle probes and Btrfs WAL cases.
+        Six original failed fixtures/read-only copies and their source/executable
+        snapshots remain unchanged, including the initial PRAGMA-type probe and
+        intermediate checkpoint/debug failures. Evidence and 472-input freeze:
+        `/tmp/mb-wal-commit-qualification`. This funds new main data extents;
+        old WAL debt, filesystem metadata/rebuild copies, durable cross-producer
+        declarations, policy/reboot lifecycle and normal paged activation remain
+        open. Require fresh installed-artifact proof of this new bridge behavior;
+        historical installed qualification does not cover it. R1/R2/R3/R5/R7/M6
+        and deferred dense/native-platform requirements remain open.
       - [x] Include native control headroom before parity admission.
         Both capacity advertisements and parity preflight omitted the managed
         control catalog's authenticated headroom. A shared verified control

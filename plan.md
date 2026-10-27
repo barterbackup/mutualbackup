@@ -7610,3 +7610,43 @@ staged debt or provide the complete durable cross-producer/cross-volume resource
 lease. Shared SQL/temporary/scratch/payload/copy reservations, policy lifecycle,
 normal paged production/retention/recovery and all remaining R1/R2/R3/R5/R7/M6
 and deferred dense/native-platform requirements remain open.
+
+
+### 2026-10-27 — Fund the exact native main extent before WAL publication
+
+New native WAL commits now preallocate and fsync their exact future main data
+extent before publication, under unchanged role/total/headroom limits. Both
+pinned bundled engines probe private opcode 1046; participating writers hold
+SQLite's checkpoint lock shared across funding and frame publication. This
+prevents a concurrent checkpoint from truncating the newly funded tail. Native
+checkpoint contention returns BUSY before funding; readers can retain their old
+snapshot while a valid writer commits. Logical main EOF is unchanged until
+checkpointing. Legacy/unsupported VFSes retain their original behavior and locks.
+
+Two meaningful baselines fail: a database larger than its 2 MiB main limit
+commits into WAL, and a reader-blocked commit has only 65,536 allocated main bytes
+for a 1,134,592-byte database. Four corrected cases prove rollback and healthy
+retry/reopen, full private extent backing without allocating the policy ceiling,
+checkpoint contention/retry, and invalid-argument/legacy behavior. A plain SQLite
+probe runs default and debug variants with assertions enforced, verifying exact
+sizes, error/retry and real checkpoint exclusion inside admission. The debug
+probe exposed an early return bypassing SQLite guard bookkeeping; errors now
+flow through normal guard cleanup. The initial SQLCipher page-size type probe,
+checkpoint critical-section failure and debug failure remain recorded.
+
+The frozen full Store suite passes 653 cases, with 32 ignored, in 711.44 seconds
+under the unchanged 900-second, four-worker, 65,536-FD bounds. All 108 volume
+cases pass (eight ignored); four WAL cases pass on owned Btrfs, and the existing
+native control/parity and scratch headroom workflows pass. Strict workspace/
+all-targets Clippy, formatting, shell syntax and diff checks pass. Acceptance now
+includes the plain bundled-engine probes and Btrfs WAL cases. Six failed fixture
+original/read-only pairs and all source/executable snapshots remain unchanged;
+the successful mount/loop/image are removed. Evidence and the 472-input freeze:
+`/tmp/mb-wal-commit-qualification`.
+
+This closes new native WAL commits' missing main-data backing. Old unfunded WAL
+debt, filesystem metadata/rebuild funding, complete durable producer/volume
+reservations, policy/reboot/adoption lifecycle and normal paged production remain
+open. Require fresh installed-binary evidence for this changed bridge before
+release qualification. Keep R1/R2/R3/R5/R7/M6 and deferred dense/native-platform
+requirements open; normal paged producers remain disabled.

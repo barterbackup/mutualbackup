@@ -22,6 +22,15 @@ the main-file ceiling. Retain the original file for retries: changing the ID,
 any ceiling or the original creation budget is refused rather than changing an
 existing catalog's policy. Managed rekey and policy migration are separate work.
 
+Before committing a native WAL transaction, the runtime allocates and syncs the
+future main-file data extent within the original main and combined ceilings.
+This backing remains available when readers delay checkpointing, so allocated
+main-file space can exceed its current logical length. A transaction whose
+resulting database exceeds the main ceiling is refused even when its WAL fits.
+Checkpoint contention can return SQLite's normal busy error; retry after the
+checkpoint completes. These checks apply to new commits and do not adopt old
+unfunded WAL debt or replace the enclosing resource reservation policy.
+
 Initialize the public identity and keep its recovery string outside the data
 directory, then create native catalogs while the daemon is stopped:
 

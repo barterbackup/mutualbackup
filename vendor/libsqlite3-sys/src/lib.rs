@@ -14,6 +14,10 @@ pub const MUTUALBACKUP_SQLITE_FCNTL_NATIVE_FD: std::ffi::c_int = 1043;
 /// Borrow an already open Unix SHM descriptor. The caller must retain its
 /// mapped main-file connection; this opcode neither opens nor grows SHM.
 pub const MUTUALBACKUP_SQLITE_FCNTL_SHM_FD: std::ffi::c_int = 1044;
+/// Before a WAL commit, fund the exact future main size (`sqlite3_int64 *`).
+/// Native physical VFS admission is mandatory; unsupported VFSes return
+/// SQLITE_NOTFOUND and retain their original behavior.
+pub const MUTUALBACKUP_SQLITE_FCNTL_WAL_COMMIT_SIZE: std::ffi::c_int = 1046;
 
 use std::mem;
 

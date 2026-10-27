@@ -56,3 +56,29 @@ These interfaces support native identity checks and the explicit runtime
 physical VFS in `mb-store`. They do not themselves establish durable writer
 enrollment, aggregate reservations, checkpoint/rebuild funding or a complete
 physical resource policy.
+
+`MUTUALBACKUP_SQLITE_FCNTL_WAL_COMMIT_SIZE` (1046) admits the future main-file
+size before a Linux WAL commit. Both bundled implementations call the original
+main sqlite3_file first with a zero-size capability probe. Participating commits
+take SQLite's shared checkpoint lock, then request exactly `nTruncate * szPage`
+through the same borrowed `sqlite3_int64 *` before `walFrames` publishes. The lock
+remains held through publication, preventing a concurrent checkpoint from
+truncating newly funded extents. Checkpoint contention follows normal SQLite
+BUSY handling before main funding. Unsupported VFSes acquire no additional lock.
+SQLITE_NOTFOUND from the probe preserves an unsupported VFS's original behavior.
+Once opted in, only SQLITE_OK from size admission permits publication; every
+other result aborts through SQLite's normal error/rollback path. Spill
+calls without a commit do not invoke this interface.
+
+The Rust physical main binding rejects null/negative arguments, funds private
+extents under its original role/total/headroom limits and keeps logical EOF
+unchanged. Nonzero admission fsyncs the borrowed main file before publication
+and rechecks accounted allocation; the zero probe performs no allocation/sync.
+It uses the existing native main descriptor; it must not reenter
+SQLite or independently open, close, truncate or relock the main file. This
+admission performs allocation/sync I/O under SQLite's WAL writer ownership. It is
+distinct from the descriptor lookups' no-I/O guarantee and from optional size
+hints. Existing WAL/journal/SHM allocations remain separately charged. This
+funds the main data extent for a new commit, including a checkpoint delayed by
+readers; existing unfunded WAL debt, filesystem metadata/rebuild copies and the
+complete durable cross-producer reservation policy remain separate obligations.

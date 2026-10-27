@@ -544,6 +544,21 @@ unsafe extern "C" fn control(
     protect(|| unsafe {
         let file = &*file.cast::<File>();
         let state = &*file.state;
+        #[cfg(target_os = "linux")]
+        if op == ffi::MUTUALBACKUP_SQLITE_FCNTL_WAL_COMMIT_SIZE
+            && let Some(binding) = &state.physical
+        {
+            if argument.is_null() {
+                return ffi::SQLITE_MISUSE;
+            }
+            let Ok(bytes) = u64::try_from(*argument.cast::<i64>()) else {
+                return ffi::SQLITE_MISUSE;
+            };
+            return match binding.fund_main_commit(bytes) {
+                Ok(()) => ffi::SQLITE_OK,
+                Err(error) => super::physical_io::sqlite_code(error, ffi::SQLITE_IOERR_WRITE),
+            };
+        }
         if op == SET_LIMIT {
             if state.journal || argument.is_null() {
                 return ffi::SQLITE_MISUSE;
