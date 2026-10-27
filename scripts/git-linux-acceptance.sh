@@ -24,6 +24,7 @@ cargo test -p mb-node network::p2p::tests::virtual_zero_routing_tests::fresh_coo
 cargo test -p mb-node node::tests::source_backend_binding_reprobes_and_migrates --locked -- --ignored --exact
 cargo test -p mb-node volume::scratch_headroom_tests::paged_scratch_preserves_native_control_headroom_and_retries_after_space_returns --locked -- --ignored --exact --nocapture
 cargo test -p mb-node volume::allocation_domain_tests:: --locked -- --ignored --nocapture --test-threads=1
+cargo test -p mb-node volume::control_headroom_tests::native_parity_refuses_unfunded_control_headroom_before_intent_and_retries --locked -- --ignored --exact --nocapture
 cargo test -p mb-node snapshot::metadata_compatibility_tests::git_history_enters_encrypted_revision_sectors_without_changing_root_restore --locked -- --ignored --exact
 cargo test -p mutualbackup --test git_remote_helper --locked -- --ignored --test-threads=1
 TMPDIR="$MUTUALBACKUP_REFLINK_TEST_ROOT" cargo test -p mutualbackup --test prototype_acceptance --locked native_enrollment:: -- --nocapture --test-threads=2

@@ -7577,3 +7577,36 @@ Keep the complete durable SQL/temporary/scratch/payload/checkpoint-copy resource
 reservation policy, policy lifecycle/adoption, normal paged production and full
 R1/R2/R3/R5/R7/M6 and deferred dense/native-platform qualification open. This is
 a demonstrated physical-sharing correction, not complete global funding.
+
+
+### 2026-10-27 — Reserve native control headroom before parity admission
+
+A verified control-write reserve now combines the native control policy's
+immutable headroom and current WAL checkpoint-copy requirement. Coding capacity
+charges it once on the control allocation domain; parity staging, reservation,
+publication and migration preflights use the same reserve when sharing that pool.
+Legacy control catalogs retain their checkpoint-only behavior. Original native
+limits, keys, signed receipts and existing intent/reconciliation state are intact.
+
+Three baseline regressions reproduce omission. In the actual Btrfs workload,
+4 MiB of parity becomes staged before its control update fails with SQLITE_FULL.
+With the fix, the same attempt refuses before payload or intent publication;
+ordinary control writes remain healthy. Releasing the same 64 MiB pressure file
+permits retry, preserving the exact signed receipt and complete 4 MiB payload
+through reopen/Merkle verification and retaining the original native policy and
+control records. No payload, signature, retry deadline or immutable ceiling is
+reduced. The provisioned Linux script runs this physical regression.
+
+All three focused cases pass in 11.13 seconds; all 108 ordinary volume cases pass
+with eight ignored. The two prior allocation-domain cases and existing native
+scratch/headroom case pass as well. Strict locked workspace/all-targets Clippy,
+format, shell syntax and diff checks pass. Retain all three baseline fixtures,
+read-only file copies and byte-identical original/read-only Btrfs image pair.
+Source/executable snapshots and cleanup evidence bind 469 source inputs at
+`/tmp/mb-control-headroom-qualification`.
+
+This fixes new admission's missing control reserve. It does not migrate old
+staged debt or provide the complete durable cross-producer/cross-volume resource
+lease. Shared SQL/temporary/scratch/payload/copy reservations, policy lifecycle,
+normal paged production/retention/recovery and all remaining R1/R2/R3/R5/R7/M6
+and deferred dense/native-platform requirements remain open.

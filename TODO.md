@@ -3326,6 +3326,31 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Include native control headroom before parity admission.
+        Both capacity advertisements and parity preflight omitted the managed
+        control catalog's authenticated headroom. A shared verified control
+        reservation now combines that immutable reserve with current control
+        WAL checkpoint space. Capacity charges it once on its allocation domain;
+        unrelated domains retain their capacity. Parity staging, reservation,
+        publication and migration preflights use the same shared-write reserve.
+        Three baseline regressions fail. The actual Btrfs case stages 4 MiB of
+        parity before its control update fails with SQLITE_FULL. The corrected
+        preflight returns CapacityExceeded with zero staged bytes and no intent
+        or receipt records; ordinary control writes remain healthy. Releasing
+        the original 64 MiB pressure file admits the identical attempt and signed
+        staged receipt. Reopen verifies the complete original 4 MiB Merkle proof,
+        exact signed receipt, original control records and unchanged native policy.
+        All three focused cases pass (11.13 seconds), 108 ordinary volume cases
+        pass with eight ignored, and the three existing provisioned Btrfs cases
+        pass. The Linux script now includes the new physical case. Strict locked
+        workspace/all-targets Clippy, format, shell syntax and diff checks pass.
+        All three failed fixtures, read-only file copies, original/read-only
+        Btrfs images and source/executable snapshots remain preserved unchanged.
+        Evidence: `/tmp/mb-control-headroom-qualification` (469 source inputs).
+        This prevents the demonstrated new unfunded staging; it does not adopt
+        old staged debt or establish durable cross-producer reservations. The
+        enclosing shared-admission, normal paged, R1/R2/R3/R5/R7, M6 and deferred
+        dense/native-platform requirements remain open.
       - [x] Account for shared Btrfs allocation across volume subvolumes.
         Writer and reader coding capacity now group physical free space by the
         existing allocation-domain identity, including Btrfs filesystem UUID,

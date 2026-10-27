@@ -158,7 +158,7 @@ fn parity_reservations_include_control_checkpoint_across_btrfs_subvolumes() {
     let parity_bytes = store.checkpoint_reservation_bytes().unwrap();
     assert!(control_bytes >= 1024 * 1024);
     assert_eq!(
-        shared_checkpoint_reservation(&control, store).unwrap(),
+        shared_write_reservation(&control, store).unwrap(),
         control_bytes + parity_bytes,
         "shared filesystem checkpoint reserve must include the control WAL"
     );

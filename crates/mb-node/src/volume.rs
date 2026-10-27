@@ -11,6 +11,9 @@ mod scratch_headroom_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod allocation_domain_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod control_headroom_tests;
+
 use anyhow::{Context, Result, bail};
 use mb_core::{
     KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
@@ -1385,7 +1388,7 @@ impl StorageVolumes {
                         .saturating_sub(volume.record.headroom_bytes);
                     let available = fs2::available_space(&volume.record.path).ok()?;
                     let physical = required_physical
-                        .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                        .saturating_add(shared_write_reservation(control, store).ok()?);
                     (used.saturating_add(required) <= writable
                         && physical <= available.saturating_sub(volume.record.headroom_bytes))
                     .then_some((*id, used))
@@ -1482,7 +1485,7 @@ impl StorageVolumes {
                             .saturating_sub(volume.record.headroom_bytes);
                         let available = fs2::available_space(&volume.record.path).ok()?;
                         let physical = required_physical
-                            .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                            .saturating_add(shared_write_reservation(control, store).ok()?);
                         (used.saturating_add(required) <= writable
                             && physical <= available.saturating_sub(volume.record.headroom_bytes))
                         .then_some((*id, used))
@@ -2320,7 +2323,7 @@ impl StorageVolumes {
             };
             let required_physical =
                 physical_write_reservation(object.bytes.len(), acknowledgement.len())
-                    .saturating_add(shared_checkpoint_reservation(control, store)?);
+                    .saturating_add(shared_write_reservation(control, store)?);
             let available = fs2::available_space(&volume.record.path)?;
             if required_physical > available.saturating_sub(reserved) {
                 return Err(DatabaseError::CapacityExceeded.into());
@@ -2349,7 +2352,7 @@ impl StorageVolumes {
                 let writable = volume.record.budget_bytes.saturating_sub(reserved);
                 let available = fs2::available_space(&volume.record.path).ok()?;
                 let required_physical = required_physical
-                    .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                    .saturating_add(shared_write_reservation(control, store).ok()?);
                 (used.saturating_add(required) <= writable
                     && required_physical <= available.saturating_sub(reserved))
                 .then_some((*id, used))
@@ -2724,8 +2727,8 @@ impl StorageVolumes {
                             .budget_bytes
                             .saturating_sub(volume.record.headroom_bytes);
                         let available = fs2::available_space(&volume.record.path).ok()?;
-                        let physical = physical
-                            .saturating_add(shared_checkpoint_reservation(control, store).ok()?);
+                        let physical =
+                            physical.saturating_add(shared_write_reservation(control, store).ok()?);
                         (used.saturating_add(object.bytes.len() as u64) <= writable
                             && physical <= available.saturating_sub(volume.record.headroom_bytes))
                         .then_some((*id, used))
@@ -2864,7 +2867,7 @@ impl StorageVolumes {
                     ready.object.bytes.len(),
                     ready.staged_receipt.len(),
                 )
-                .saturating_add(shared_checkpoint_reservation(control, store)?);
+                .saturating_add(shared_write_reservation(control, store)?);
                 let available = fs2::available_space(&volume.record.path)?;
                 if physical > available.saturating_sub(volume.record.headroom_bytes) {
                     bail!("variable migration destination has insufficient physical headroom");
@@ -4478,13 +4481,13 @@ fn device_coding_capacity(
     shard_size: u32,
 ) -> Result<u64> {
     let control_device = control_allocation_domain(control)?;
-    let control_checkpoint = control.checkpoint_reservation_bytes()?;
+    let control_reservation = control_write_reservation(control)?;
     let required_physical = physical_write_reservation(shard_size as usize, 0);
     Ok(devices
         .iter()
         .map(|(device, capacity)| {
             let control_reserve = if *device == control_device {
-                control_checkpoint
+                control_reservation
             } else {
                 0
             };
@@ -4510,12 +4513,25 @@ fn physical_write_reservation(payload_bytes: usize, acknowledgement_bytes: usize
         .saturating_add(PHYSICAL_WRITE_FIXED_RESERVE)
 }
 
-fn shared_checkpoint_reservation(control: &ControlStore, parity: &ParityStore) -> Result<u64> {
+fn shared_write_reservation(control: &ControlStore, parity: &ParityStore) -> Result<u64> {
     let mut reservation = parity.checkpoint_reservation_bytes()?;
     if control_allocation_domain(control)? == parity_allocation_domain(parity)? {
-        reservation = reservation.saturating_add(control.checkpoint_reservation_bytes()?);
+        reservation = reservation.saturating_add(control_write_reservation(control)?);
     }
     Ok(reservation)
+}
+
+/// Control metadata must remain writable while parity is staged on the same
+/// physical pool. Include its immutable native reserve as well as WAL copy
+/// space in both advertisements and preflight; this is not a durable lease.
+fn control_write_reservation(control: &ControlStore) -> Result<u64> {
+    let checkpoint = control.checkpoint_reservation_bytes()?;
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = control.native_database_owner() {
+        owner.verify_current()?;
+        return Ok(checkpoint.saturating_add(owner.policy().headroom_bytes));
+    }
+    Ok(checkpoint)
 }
 
 fn volume_database_id(volume_id: Uuid) -> Vec<u8> {
@@ -6936,7 +6952,7 @@ mod tests {
         }
         let object = parity_object(180, 4);
         let reservation = physical_write_reservation(object.bytes.len(), acknowledgement.len());
-        let checkpoint_reservation = shared_checkpoint_reservation(
+        let checkpoint_reservation = shared_write_reservation(
             &control,
             volumes
                 .volumes
