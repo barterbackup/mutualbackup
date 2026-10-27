@@ -398,9 +398,34 @@ impl ControlStore {
         &self,
         physical_bytes: u64,
     ) -> Result<Option<CatalogScratchLease>, CatalogStoreError> {
-        if physical_bytes == 0 {
+        let Some(mut leases) = self.reserve_catalog_scratch_batch(&[physical_bytes])? else {
+            return Ok(None);
+        };
+        Ok(Some(leases.pop().ok_or(DatabaseError::Integrity)?))
+    }
+
+    /// Atomically admit a complete bounded set of scratch declarations. Every
+    /// member retains its own byte ceiling and ownership/job slot; all existing
+    /// pool limits and lease encodings remain unchanged. No prefix is committed
+    /// if capacity, owner creation or any SQL write fails. As with single
+    /// admissions, up to one bounded abandoned-credit reclamation per member
+    /// may commit first. Stop when no more safely reclaimable debt exists.
+    /// These are credit tokens: each VFS must still fund its physical backing
+    /// before consuming source data. Returned leases can close independently.
+    pub fn reserve_catalog_scratch_batch(
+        &self,
+        physical_bytes: &[u64],
+    ) -> Result<Option<Vec<CatalogScratchLease>>, CatalogStoreError> {
+        if physical_bytes.is_empty()
+            || physical_bytes.len() > SLOTS as usize
+            || physical_bytes.contains(&0)
+        {
             return Err(DatabaseError::NotReady.into());
         }
+        let total = physical_bytes.iter().try_fold(0u64, |sum, bytes| {
+            sum.checked_add(*bytes)
+                .ok_or(DatabaseError::CapacityExceeded)
+        })?;
         // Unconfigured legacy/read-only consumers need no writer or token.
         // Compose this probe with a caller's existing read/write snapshot.
         let configured = snapshot(self, |cx| {
@@ -420,7 +445,13 @@ impl ControlStore {
         if !self.connection.is_autocommit() {
             return Err(DatabaseError::NotReady.into());
         }
-        self.reclaim_abandoned_catalog_scratch()?;
+        // Preserve the reclamation allowance of N separate admissions. A
+        // stopped N-index job must not prevent its complete replacement.
+        for _ in physical_bytes {
+            if !self.reclaim_abandoned_catalog_scratch()? {
+                break;
+            }
+        }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let Some(old) = read(&tx)? else {
             if resource(&tx)?.is_some() {
@@ -434,11 +465,11 @@ impl ControlStore {
         let next = Ledger {
             reserved: old
                 .reserved
-                .checked_add(physical_bytes)
+                .checked_add(total)
                 .ok_or(DatabaseError::CapacityExceeded)?,
             jobs: old
                 .jobs
-                .checked_add(1)
+                .checked_add(physical_bytes.len() as u32)
                 .ok_or(DatabaseError::CapacityExceeded)?,
             ..old
         };
@@ -458,33 +489,48 @@ impl ControlStore {
                 Some((spec.id, spec.owner.ok_or(DatabaseError::Integrity)?));
         }
         token.validate_owners(&expected)?;
-        let slot = token.claim_slot(&used)?;
-        #[cfg(target_os = "linux")]
-        let database_identity = token.pin_database()?;
-        let id = Uuid::new_v4();
-        let owner = token.create_owner(slot, id)?;
-        let spec = Spec {
-            version: 2,
-            id,
-            physical_bytes,
-            domain: token.domain.id,
-            slot,
-            owner: Some(owner.identity),
-        };
-        for kind in [LEASE, LEASE_GUARD] {
-            insert_exact(&tx, kind, spec.id.as_bytes(), &encoded(&spec)?)?;
+        let domain = token.domain;
+        let mut first = Some(token);
+        let mut leases = Vec::with_capacity(physical_bytes.len());
+        for &physical_bytes in physical_bytes {
+            // Independent open file descriptions let one returned lease drop
+            // without retaining its slot through the other batch members.
+            let token = match first.take() {
+                Some(token) => token,
+                None => FileLock::existing(self, domain, live_lock::SCRATCH)?,
+            };
+            let slot = token.claim_slot(&used)?;
+            used[slot as usize] = true;
+            #[cfg(target_os = "linux")]
+            let database_identity = token.pin_database()?;
+            let id = Uuid::new_v4();
+            let owner = token.create_owner(slot, id)?;
+            let spec = Spec {
+                version: 2,
+                id,
+                physical_bytes,
+                domain: token.domain.id,
+                slot,
+                owner: Some(owner.identity),
+            };
+            for kind in [LEASE, LEASE_GUARD] {
+                insert_exact(&tx, kind, spec.id.as_bytes(), &encoded(&spec)?)?;
+            }
+            leases.push(CatalogScratchLease {
+                spec,
+                #[cfg(target_os = "linux")]
+                _database_identity: database_identity,
+                owner,
+                token,
+            });
         }
         write(&tx, old, next)?;
-        token.check(self)?;
-        owner.check()?;
+        for lease in &leases {
+            lease.token.check(self)?;
+            lease.owner.check()?;
+        }
         tx.commit()?;
-        Ok(Some(CatalogScratchLease {
-            spec,
-            #[cfg(target_os = "linux")]
-            _database_identity: database_identity,
-            owner,
-            token,
-        }))
+        Ok(Some(leases))
     }
 
     /// Reclaim at most one stopped VFS declaration. Process IDs and ages grant

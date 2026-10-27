@@ -25,6 +25,65 @@ impl Drop for PreservedTemp {
     }
 }
 
+#[test]
+fn checkpoint_scratch_batch_refuses_complete_credits_without_partial_debt_and_retries() {
+    let (temp, _, mut node, _) = fixture();
+    let _temp = PreservedTemp(Some(temp));
+    resources::configure(&mut node);
+    let limits = mb_store::ScratchStorageLimits::for_database(1 << 20).unwrap();
+    let pool = node
+        .control
+        .catalog_scratch_pool_usage()
+        .unwrap()
+        .unwrap()
+        .policy;
+    let blocker = node
+        .control
+        .reserve_catalog_scratch(pool.physical_bytes - limits.max_physical_bytes)
+        .unwrap()
+        .unwrap();
+    let before = node.control.catalog_scratch_pool_usage().unwrap();
+    let refused = crate::volume::paged_scratch_stores(&node.control, [1 << 20; 2]);
+    let error = refused.err().expect("only one complete declaration fits");
+    assert!(matches!(
+        error.downcast_ref::<mb_store::CatalogStoreError>(),
+        Some(mb_store::CatalogStoreError::ScratchPoolExhausted)
+    ));
+    assert_eq!(node.control.catalog_scratch_pool_usage().unwrap(), before);
+    assert!(!node.reclaim_abandoned_catalog_scratch().unwrap());
+    drop(blocker);
+    assert!(node.reclaim_abandoned_catalog_scratch().unwrap());
+    let [history, body] = crate::volume::paged_scratch_stores(&node.control, [1 << 20; 2]).unwrap();
+    assert!(
+        history
+            .put_record_if_absent("batch", b"history", b"original history")
+            .unwrap()
+    );
+    assert!(
+        body.put_record_if_absent("batch", b"body", b"original authority")
+            .unwrap()
+    );
+    assert_eq!(
+        node.control
+            .catalog_scratch_pool_usage()
+            .unwrap()
+            .unwrap()
+            .open_jobs,
+        2
+    );
+    drop(history);
+    assert!(node.reclaim_abandoned_catalog_scratch().unwrap());
+    assert!(!node.reclaim_abandoned_catalog_scratch().unwrap());
+    assert_eq!(
+        body.get_record_bounded("batch", b"body", 64).unwrap(),
+        Some(b"original authority".to_vec())
+    );
+    drop(body);
+    assert!(node.reclaim_abandoned_catalog_scratch().unwrap());
+    let usage = node.control.catalog_scratch_pool_usage().unwrap().unwrap();
+    assert_eq!((usage.reserved_physical_bytes, usage.open_jobs), (0, 0));
+}
+
 pub(super) fn quota(node: &Node) {
     if node.control.catalog_resource_policy().unwrap().is_some() {
         return;

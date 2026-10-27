@@ -14,7 +14,7 @@ mod allocation_domain_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod control_headroom_tests;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use mb_core::{
     KeyMaterial, MerkleCommitment, MerkleRangeProof, NodeId, SignedRecord, WrappedDatabaseKey,
     canonical_bytes, canonical_bytes_bounded, decode_canonical,
@@ -3898,19 +3898,40 @@ pub(crate) fn paged_scratch_store(
     control: &ControlStore,
     max_database_bytes: u64,
 ) -> Result<mb_store::RecordScratchStore> {
+    let [store] = paged_scratch_stores(control, [max_database_bytes])?;
+    Ok(store)
+}
+
+/// Admit every declared index in one credit transaction, before funding any
+/// backing file. All members protect the same validated volume registry and
+/// native/checkpoint headroom. Enrolled stores return only after every complete
+/// backing file is funded.
+/// Metered callers prepay one admission allowance per member.
+pub(crate) fn paged_scratch_stores<const N: usize>(
+    control: &ControlStore,
+    max_database_bytes: [u64; N],
+) -> Result<[mb_store::RecordScratchStore; N]> {
+    ensure!(
+        (1..=64).contains(&N),
+        "scratch batch must contain one to 64 indexes"
+    );
+    let limits = max_database_bytes
+        .into_iter()
+        .map(mb_store::ScratchStorageLimits::for_database)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     #[cfg(target_os = "linux")]
     {
+        let mut limits = limits;
         let directory = control
             .path()
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let device = mb_store::physical_allocation_domain(directory)?;
-        let mut limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
+        let mut headroom = 0u64;
         if let Some(owner) = control.native_database_owner() {
             owner.verify_current()?;
-            limits.headroom_bytes = limits
-                .headroom_bytes
+            headroom = headroom
                 .checked_add(owner.policy().headroom_bytes)
                 .context("scratch control headroom overflow")?;
         }
@@ -3924,42 +3945,75 @@ pub(crate) fn paged_scratch_store(
                 Err(error) => return Err(error.into()),
             }
             if mb_store::physical_allocation_domain(&record.path)? == device {
-                limits.headroom_bytes = limits
-                    .headroom_bytes
+                headroom = headroom
                     .checked_add(record.headroom_bytes)
                     .and_then(|bytes| bytes.checked_add(PHYSICAL_WRITE_FIXED_RESERVE))
                     .context("scratch headroom overflow")?;
                 checkpoints.push(record.path.join(&record.database_file));
             }
         }
-        match control.reserve_catalog_scratch(limits.max_physical_bytes)? {
-            Some(lease) => Ok(
-                mb_store::RecordScratchStore::new_in_with_reserved_checkpoint_space(
-                    directory,
-                    limits,
-                    &checkpoints,
-                    lease,
-                )?,
-            ),
-            None => Ok(
-                mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
-                    directory,
-                    limits,
-                    &checkpoints,
-                )?,
-            ),
+        for limit in &mut limits {
+            limit.headroom_bytes = limit
+                .headroom_bytes
+                .checked_add(headroom)
+                .context("scratch headroom overflow")?;
         }
+        let physical = limits
+            .iter()
+            .map(|limit| limit.max_physical_bytes)
+            .collect::<Vec<_>>();
+        let leases = control.reserve_catalog_scratch_batch(&physical)?;
+        ensure!(
+            leases.as_ref().is_none_or(|leases| leases.len() == N),
+            "scratch batch admission changed its member count"
+        );
+        let mut leases = leases.map(Vec::into_iter);
+        let mut stores = Vec::with_capacity(N);
+        for (index, limits) in limits.into_iter().enumerate() {
+            let store = match &mut leases {
+                Some(leases) => {
+                    mb_store::RecordScratchStore::new_in_with_reserved_checkpoint_space(
+                        directory,
+                        limits,
+                        &checkpoints,
+                        leases
+                            .next()
+                            .context("scratch batch lost an admitted member")?,
+                    )
+                }
+                None => mb_store::RecordScratchStore::new_in_with_checkpoint_reservations(
+                    directory,
+                    limits,
+                    &checkpoints,
+                ),
+            }
+            .with_context(|| {
+                format!(
+                    "fund paged scratch member {index} ({} database bytes, {} physical bytes)",
+                    limits.max_database_bytes, limits.max_physical_bytes
+                )
+            })?;
+            stores.push(store);
+        }
+        stores
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("scratch batch construction changed its member count"))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let limits = mb_store::ScratchStorageLimits::for_database(max_database_bytes)?;
-        if control
-            .reserve_catalog_scratch(limits.max_physical_bytes)?
-            .is_some()
-        {
+        let physical = limits
+            .iter()
+            .map(|limit| limit.max_physical_bytes)
+            .collect::<Vec<_>>();
+        if control.reserve_catalog_scratch_batch(&physical)?.is_some() {
             bail!("resource-backed physical scratch allocation is unsupported on this platform");
         }
-        Ok(mb_store::RecordScratchStore::new(max_database_bytes)?)
+        limits
+            .into_iter()
+            .map(|limit| mb_store::RecordScratchStore::new(limit.max_database_bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("scratch batch construction changed its member count"))
     }
 }
 

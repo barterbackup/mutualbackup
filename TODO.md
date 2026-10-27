@@ -3462,6 +3462,49 @@ before installed qualification; this standalone target does not close R7 or M6.
           identify the history/body/ancestry/native/Git phase. The complete
           original chain cases above exercise both certificate layouts through
           their actual enrolled funding and retained-proof lifetimes.
+        - [x] Atomically admit the complete history/body credit batch before
+          funding either index. The sequential reference committed 3,342,336
+          bytes and one extra job of stopped debt when the second declaration
+          could not fit. Bounded batch admission now checks the complete byte/
+          job sum, creates independently owned v2 leases and updates both ledger
+          guards in one writer. Late ABORT/IGNORE faults roll back every new
+          declaration; stopped owner files retain their existing bounded reuse
+          rules. Each member keeps its original ceiling and independent open
+          file description, so dropping one releases its slot without retaining
+          or reclaiming another live member. The maximum remains 64 slots with
+          unchanged policy/lease encodings and filesystem/process checks.
+          A draft regression reclaimed only one stopped member before replacing
+          a complete batch. The two-member replacement case reproduced
+          ScratchPoolExhausted; admission now preserves one bounded reclamation
+          per requested member, stopping when no safe debt remains. Those
+          reclamations may commit before a refused batch, as for separate
+          admissions. The Node constructor validates the common volume registry
+          and headroom once, claims the whole batch, then funds every backing
+          before returning any index. Checkpoint replay keeps both original
+          traversal scan allowances. Filesystem funding is still individual;
+          this closes partial credit admission, not complete shared physical
+          job reservation or all retained-proof lifetimes.
+          Four batch regressions cover combined byte/job refusal without a
+          committed prefix, all 64 slots across reopen, independent reclamation,
+          complete stopped-job replacement and late ABORT/IGNORE retry. The Node
+          regression checks exact unchanged debt on refusal, real funded retry
+          and the surviving index after its sibling closes. Full frozen Store
+          passes 676 with 32 ignored in 821.08 seconds under the unchanged
+          900-second/four-worker/65,536-FD gate. All 108 volume cases pass (eight
+          ignored); the original individual/directory chains pass in 544.17/
+          549.74 seconds with unchanged data, work, deadlines and assertions.
+          Owned Btrfs passes four batch, four funded, five arena and the native
+          headroom case. Strict locked workspace/all-target Clippy, formatting
+          and diff checks pass. Frozen sources/executables, the sequential
+          reference image/read-only copy, the stopped-credit regression's
+          original/read-only files and an intentionally interrupted superseded
+          Store run remain under `/tmp/mb-scratch-batch-qualification`.
+          That run was stopped at 274.18 seconds for the identified draft retry
+          defect; it did not time out or report a failed case. It does not
+          diagnose the earlier unexplained Store timeout. The final 479-input
+          audit is `/tmp/mb-scratch-batch-qualification/audit.json`; successful
+          mounts, loops and images are removed. Full ordinary Node/workspace,
+          installed, native-platform and dense 1 TiB gates remain open.
         - [ ] Finish complete enclosing-job reservation and traversal accounting
           across metadata preflight, history/body replay, ancestry rebuild and
           full restore. Current phase declarations use trusted event counts,

@@ -451,21 +451,27 @@ impl RetainedCheckpointRestore {
                 )?
                 .context("acquisition has no original genesis")?,
         )?;
-        let scratch = |limits: mb_store::ScratchStorageLimits| -> Result<_> {
-            if let ProofInput::Retained { meter, .. } = input {
-                meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
-            }
-            crate::volume::paged_scratch_store(control, limits.max_database_bytes)
-        };
-        // Both complete indexes must be funded before the first history page
-        // is read. A second admission refusal cannot follow a consumed prefix.
-        let history_store = scratch(mb_store::CatalogGuildHistoryIndex::scratch_storage_limits(
+        let history_limits = mb_store::CatalogGuildHistoryIndex::scratch_storage_limits(
             trust.event_sequence,
             budget,
-        )?)
-        .context("fund original-history checkpoint scratch")?;
-        let body_store = scratch(certificate.scratch_storage_limits(previous, budget)?)
-            .context("fund authority checkpoint scratch")?;
+        )?;
+        let body_limits = certificate.scratch_storage_limits(previous, budget)?;
+        if let ProofInput::Retained { meter, .. } = input {
+            // Preserve both original scan allowances, even though the batch
+            // now reads the shared registry and claims the ledger only once.
+            meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+            meter.charge(crate::volume::PAGED_SCRATCH_ADMISSION_WORK)?;
+        }
+        // Reserve both byte/slot declarations atomically, then fund both
+        // complete backing files before consuming the first history page.
+        let [history_store, body_store] = crate::volume::paged_scratch_stores(
+            control,
+            [
+                history_limits.max_database_bytes,
+                body_limits.max_database_bytes,
+            ],
+        )
+        .context("fund checkpoint history and authority scratch")?;
         let mut source = HistoryPrefix {
             control,
             sequence: trust.event_sequence,
