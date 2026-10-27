@@ -7384,3 +7384,52 @@ payloads and deadlines are unchanged. Keep the original negatives and incomplete
 source attempts as historical evidence. Require fresh complete workspace,
 provisioned/bulk and installed-artifact qualification before closing R7; this
 standalone target does not close M6 or enable normal paged producers.
+
+### 2026-10-27 — Qualify the merged source and installed native musl runtime
+
+Committed `c37acf2` passes the fresh complete-source gate: 1,739 ordinary cases,
+including Store 640 in 695.11 seconds under the unchanged 900-second bound and
+Node 632 in 2,020.35 seconds. Original bulk workloads above 512 MiB, provisioned
+native/kernel/recovery and virtual-zero routing checks yield 1,752 distinct
+cases in 1,834 executions. The independent audit verifies all 461 inputs,
+source archive, 23 executables, exact case inventories, five coverage traces
+without dropped events, preserved negatives and owned cleanup. Another 125
+ignored cases remain unexecuted. Evidence:
+`/tmp/mb-curve-dev-full-qual-u3cupign/audit.json`.
+
+The same revision builds offline for musl and passes immutable-source/static
+payload/wrapper/alias audit. Installed acceptance passes 27 distinct process
+cases in 28 executions and three isolated-PATH Git scenarios. Topology/seed
+recovery completes in 877.41 seconds; two distinct relay signer-partition and
+coordinator-crash retries complete in 913.19 and 930.57 seconds. Each preserves
+and authenticates the original four signatures from a stopped catalog copy,
+then commits the same event with all five original signers. Neither interruption
+occurs after completed activation, and these positives do not explain the older
+historical stall.
+
+Fresh native runtime passes three installed daemon cycles in 56.32 seconds,
+preserving the original payload, signed ACK and 12 immutable inputs. Actual
+daemon startup completes all three interrupted record quotas; 12 installed
+query-only cipher mutations are denied; the original 3 MiB SQL probe hits the
+unchanged 2 MiB physical ceiling without publishing a row, then reopens healthy.
+Source APIs create the fixture; installed creator/enrollment APIs remain open.
+
+Preserve two harness negatives and their original/read-only image hashes. The
+first inventory omitted the existing identity manifest; its correction adds
+`identity.toml` without lowering the required count or equality checks. The
+second helper expected live object counts from a closed retired volume; the
+correction requires closed Retired status and directly checks zero fixed and
+variable objects through its authenticated read-only catalog. All original
+workloads, quotas, payloads, deadlines and three cycles remain intact. Fresh
+native qualification reuses the already passing process matrix only after
+binding its exact source/candidate/driver/log identities. The final audit also
+verifies 104 installed daemon observations, helper/dependencies, both preserved
+negatives and filesystem/network/process cleanup. Evidence:
+`/tmp/mb-installed-native-final-v3-2dvlj5af/installed-audit.json`; original build
+and process evidence: `/tmp/mb-installed-c37acf2-jwvseexv`; second negative:
+`/tmp/mb-installed-native-inventory-v2-dir9gv20`.
+
+Close the focused R7 packaged-musl physical-SQL qualification item. Keep the
+enclosing R1/R2/R3/R5/R7, shared resource admission, policy enrollment/rekey,
+normal paged production/retention/recovery, historical unexplained failures and
+deferred dense 1 TiB/native-platform requirements open. Producers remain disabled.

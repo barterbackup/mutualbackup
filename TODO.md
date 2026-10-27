@@ -5475,7 +5475,7 @@ before installed qualification; this standalone target does not close R7 or M6.
     The other 125 ignored cases remain unexecuted. This is historical source
     evidence after the portability correction below, not installed qualification
     or closure of the separate native/relay timeout observations or M6.
-  - [ ] Qualify native physical SQL on the packaged musl target. The pinned
+  - [x] Qualify native physical SQL on the packaged musl target. The pinned
     release build on `30cff18` fails at FIEMAP because musl's `libc::ioctl`
     request is `c_int`, while the new allocator casts it to glibc's `c_ulong`.
     `negative-build-audit.json` in `/tmp/mb-m6-installed-30cff18-24xko1zm`
@@ -5488,9 +5488,57 @@ before installed qualification; this standalone target does not close R7 or M6.
     21 physical cases pass on owned Btrfs, with strict all-Store-target Clippy,
     formatting and independent archive/executable/unchanged-assertion/payload/
     deadline/cleanup audit. Evidence: `/tmp/mb-m6-ioctl-portability-ra41ei6j`.
-    The corrected musl build and fresh merged-source prerequisite remain
-    required before installed runtime qualification. R1/R2/R3/R5/R7 remain open;
-    normal paged producers stay disabled and deferred hardware gates unchanged.
+    The corrected musl build and merged-source prerequisite are now qualified
+    on `c37acf2` (2026-10-27). All 1,739 ordinary cases pass, including Store
+    640 in 695.11 seconds under its original 900-second bound and Node 632 in
+    2,020.35 seconds. Original bulk payloads above 512 MiB, provisioned native
+    physical/ownership/lifecycle/recovery cases, kernel checks and virtual-zero
+    routing bring the total to 1,752 distinct cases in 1,834 executions.
+    The independent audit verifies all 461 tracked inputs, the source archive,
+    23 executable identities, exact target inventories, five coverage traces
+    without dropped events, preserved negatives and owned filesystem cleanup.
+    The other 125 ignored cases remain unexecuted. Evidence:
+    `/tmp/mb-curve-dev-full-qual-u3cupign/audit.json`.
+
+    The exact committed source builds offline for musl; immutable Nix source,
+    four static payloads, wrappers and optional Git alias verify. Installed
+    acceptance passes 27 distinct process cases in 28 executions and all three
+    isolated-PATH Git scenarios. Topology/seed recovery passes in 877.41 seconds;
+    two distinct signer-partition/coordinator-crash requests pass in 913.19 and
+    930.57 seconds, with the original four signatures independently verified
+    from stopped catalog copies and the same event committed with all five
+    original signers. Both interruptions precede completed activation; they do
+    not qualify the completed-activation retry branch or explain the historical
+    relay stall.
+
+    Fresh installed native runtime passes three daemon cycles in 56.32 seconds:
+    migration preserves the exact payload and original signed ACK; all three
+    interrupted record quotas become Active through actual daemon startup;
+    all 12 query-only key/rekey variants are denied; the original 3 MiB write
+    is refused under the unchanged 2 MiB physical control ceiling, leaves no
+    probe row and permits a healthy restart. All 12 immutable identity/profile/
+    manifest/birth/readiness inputs retain exact bytes and modes. The setup
+    helper uses qualified source APIs; installed creator/enrollment APIs are
+    not exercised. Authenticated read-only catalog counts verify the retired
+    source is empty while its live status correctly reports unavailable counts.
+
+    Two harness failures remain preserved: the initial immutable inventory
+    omitted `identity.toml`, and a later helper incorrectly expected a live
+    object count from a closed retired volume. Corrected fresh fixtures add the
+    identity record and directly verify zero fixed/variable objects, retaining
+    the original count/equality, payload, policy, deadline and three-cycle checks.
+    Original failed images and read-only copies verify unchanged; no forensic
+    Node open is used. Passing process evidence is reused with exact source,
+    candidate, driver and log identities. The final audit verifies 104 installed
+    daemon observations, helper/dependency identities and filesystem/network/
+    process cleanup. Evidence:
+    `/tmp/mb-installed-native-final-v3-2dvlj5af/installed-audit.json`, with original
+    process/build evidence at `/tmp/mb-installed-c37acf2-jwvseexv` and the second
+    preserved negative at `/tmp/mb-installed-native-inventory-v2-dir9gv20`.
+    This closes the focused packaged-musl qualification item. R1/R2/R3/R5/R7,
+    shared admission, native policy enrollment/rekey, normal paged integration
+    and the deferred dense 1 TiB/native-platform gates remain open; normal paged
+    producers stay disabled.
 
   - [x] Port the five-peer format-7 checkpoint fixture to native Git capture and
     normal Git commands. Preserve exact CRLF/NUL blob OIDs and bytes, branches,
