@@ -155,6 +155,16 @@ The tree was clean at review start. This pass inspected source and regression
 definitions only; it ran no builds, tests or runtime probes and did not rerun the
 recorded qualification evidence.
 
+Implementation follow-up on 2026-10-27: the shared Linux parity opener now
+resumes interrupted record-quota adoption for managed default and additional
+volumes, retaining their native ownership and physical admission. Both new
+regressions fail before the correction and pass unchanged afterward. The
+120-case ordinary volume/quota cohort, three Btrfs restart cases, strict Node
+test Clippy and formatting pass; the focused evidence is recorded under
+R3-NATIVE-RECORD-QUOTA-RESTART below. R5-VIRTUAL-ZERO-ROUTING remains the next
+named correction before a fresh complete-source/packaged qualification gate.
+The enclosing R1/R2/R3/R5/R7 and remaining M6 requirements remain open.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git
@@ -3112,6 +3122,20 @@ recorded qualification evidence.
       current merged-source/installed qualification. The separate additional
       native volume draft remains uncommitted and unqualified. Enclosing R3 and
       R1/R2/R5/R7 remain open; normal paged producers stay disabled.
+    - [x] Reject SQLCipher key changes before query-only shell preparation can
+      mutate the catalog. `845ac43` extends the preparation authorizer to deny
+      `key`, `rekey`, `hexkey`, `hexrekey`, `textkey` and `textrekey`, including
+      mixed-case, quoted and schema-qualified forms. SQLCipher applies these
+      operations during preparation, before ordinary `query_only` protection.
+      Four preserved baseline regressions fail; all 16 targeted shell cases
+      pass after correction. Coverage checks unchanged encrypted bytes,
+      original-key reopen, normal writes and original parity acknowledgements
+      in legacy/native control/parity stores, read-only cipher inspection and
+      explicitly writable legacy rekey. The prior 24 negative fixtures and
+      read-only copies remain unchanged under
+      `/tmp/mb-m6-shell-pragma-qual-kahyf7pr`. This is focused shell qualification;
+      it does not diagnose the separate broad runner timeout or replace current
+      complete-source/installed qualification.
     - [x] Create/resume additional native parity volumes through the managed
       Node API. Code `afc3d77` adds `create_native_storage_volume` with an explicit
       original I/O policy and payload budget. A signed parent/UUID/policy profile
@@ -3136,26 +3160,27 @@ recorded qualification evidence.
       pending. CLI/default policy selection, managed rekey/adoption, host reboot,
       enclosing funding and normal paged integration remain open; producers stay
       disabled and deferred hardware requirements are unchanged.
-    - [ ] **R3-NATIVE-RECORD-QUOTA-RESTART / P2 — Resume interrupted record-quota
-      adoption when reopening managed parity.** The format-2 branch in
-      `crates/mb-node/src/volume/opening.rs` returns the managed Store directly,
-      bypassing the `Adopting` resume loop in the legacy `open_admitted` path.
-      `Node::configure_volume_record_quota` adopts existing records in separately
-      committed bounded steps, so process death can leave that state durable.
-      Native Store initialization validates the schema but does not advance the
-      adoption cursor; common Node startup resumes only the control quota.
-      Reopening a managed volume can therefore retain an incomplete adoption
-      whose triggers reject ordinary parity writes and reservations, rather than
-      completing it before reconciliation. Keep the managed lease, physical
-      admission and original quota while resuming the same bounded cursor after
-      either parity opener. Extend
-      `node_startup_resumes_interrupted_record_quota_before_normal_reconciliation`
-      to managed default and additional volumes: interrupt adoption, reopen,
-      require Active before normal writes, and preserve exact payloads,
-      acknowledgements, original quota and native ownership/physical limits;
-      verify the completed counters. The existing regression uses legacy Node
-      creation only. This finding is source-confirmed; no new runtime reproduction
-      was run during this review.
+    - [x] **R3-NATIVE-RECORD-QUOTA-RESTART / P2 — Resume interrupted record-quota
+      adoption when reopening managed parity.** The format-2 branch formerly
+      returned its managed Store without the legacy opener's adoption loop.
+      Two new Node regressions reproduce a durable partially scanned table on
+      default and additional native volumes; both fail with `quota remains
+      Adopting` before correction. The shared Linux opener now finishes the
+      same bounded cursor on the admitted Store before reconciliation, retaining
+      its managed lease, original key/quota and physical limits. The identical
+      regressions pass, preserving exact payloads/ACKs, checking completed row
+      accounting and byte-counter growth, admitting ordinary reservation and
+      publication writes, and retaining completed counters through another reopen.
+      All 120 ordinary volume/configuration/native-runtime/quota cases pass
+      (four top-level cases ignored). Both new cases and the existing legacy
+      startup regression also pass on disposable Btrfs. Strict Node-test Clippy,
+      formatting and diff checks pass. `audit.json` under
+      `/tmp/mb-native-quota-restart-3onrxv8l` verifies 459 source inputs, both
+      archives/executables, unchanged regression source, selected case coverage,
+      both unchanged negative fixtures/30 files and their read-only copies, and
+      owned mount/loop/image removal. This closes the focused restart defect;
+      R5-VIRTUAL-ZERO-ROUTING, current complete-source/installed qualification,
+      normal paged integration and the enclosing R1/R2/R3/R5/R7 remain open.
     - [ ] Complete managed native policy lifecycle and product enrollment.
       Explicit Store/Node creation, same-host process restart, ordinary managed
       opens/readers and additional native volume birth are implemented above.

@@ -7197,3 +7197,39 @@ binary/unchanged-assertion/payload/deadline/cleanup audit pass under
 merged-source prerequisite remain before installed runtime qualification. The
 `30cff18` source pass is historical evidence after this correction. Enclosing
 R1/R2/R3/R5/R7, normal paged integration and deferred hardware gates remain open.
+
+
+### 2026-10-27 — Reject cipher mutation during inspection and resume native quotas
+
+`845ac43` corrects the query-only shell's preparation authority. SQLCipher key
+and rekey operations execute while preparing their PRAGMAs, before SQLite's
+ordinary query-only checks. The authorizer now rejects all six key/rekey names
+before those side effects, using SQLite's decoded names for case, quoting and
+schema qualification. All 16 targeted shell cases pass, including preserved
+original encrypted bytes/keys/acknowledgements, normal followup writes,
+read-only cipher inspection and explicitly writable legacy rekey. The prior
+24 negative fixtures remain unchanged. This does not explain the separate broad
+Store runner timeout.
+
+The managed parity opener also skipped interrupted record-quota adoption.
+Two new Node regressions fail on the baseline: default and additional native
+volumes reopen with a durable partially scanned quota still Adopting. A shared
+Linux opener helper now completes the existing bounded cursor on the admitted
+Store before reconciliation, retaining its native lease, key, quota and physical
+policy. Identical regressions check original payload/ACK preservation, completed
+row accounting, byte-counter growth, ordinary reservation/publication writes and
+stable counters on a second reopen.
+
+The ordinary volume/configuration/native-runtime/quota cohort passes 120 cases,
+with four top-level cases ignored. Both new managed regressions and the existing
+legacy startup regression pass on disposable Btrfs. Strict Node-test Clippy,
+formatting and diff checks pass. The audit in
+`/tmp/mb-native-quota-restart-3onrxv8l` verifies 459 source inputs, baseline/final
+archives and executables, unchanged regression source, case coverage, both
+unchanged negative fixtures/30 files with read-only copies, and owned
+mount/loop/image removal. These are focused corrections and qualifications.
+
+Next correct R5-VIRTUAL-ZERO-ROUTING before a fresh complete-source prerequisite
+and corrected packaged musl qualification. R1/R2/R3/R5/R7, enclosing capacity and
+normal paged integration remain open; deferred native-platform and dense 1 TiB
+requirements retain their original scope. No installed qualification ran here.

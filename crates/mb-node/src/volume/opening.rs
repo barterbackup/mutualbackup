@@ -97,6 +97,12 @@ fn open_admitted(
             database_key,
         )?;
     }
+    resume_record_quota_adoption(store)
+}
+
+fn resume_record_quota_adoption(mut store: ParityStore) -> Result<ParityStore> {
+    // Finish interrupted accounting on the admitted connection, retaining its
+    // native ownership lease and physical limits before Node reconciliation.
     while store
         .record_quota_usage()?
         .is_some_and(|usage| usage.state == mb_store::DatabaseRecordQuotaState::Adopting)
@@ -308,7 +314,9 @@ pub(super) fn open_volume_store_in_directory(
         drop(reader);
         before_writer();
         require_current_directory(directory, &record.path)?;
-        return Ok(inspection.open_parity_admitted(directory, keys, &guard)?);
+        return resume_record_quota_adoption(
+            inspection.open_parity_admitted(directory, keys, &guard)?,
+        );
     }
     let legacy_key = keys.database_key(&legacy_volume_database_id(record.volume_id));
     let selected = admit_key(
