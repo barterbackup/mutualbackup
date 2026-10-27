@@ -130,6 +130,8 @@ struct DiskFile {
     state: *const State,
     allocated: u64,
     charged: u64,
+    physical_bytes: u64,
+    headroom_pending: bool,
 }
 
 #[repr(C)]
@@ -278,7 +280,136 @@ impl Drop for AllocationLock<'_> {
     }
 }
 
+impl State {
+    fn allocation_guard(&self) -> Result<AllocationLock<'_>, c_int> {
+        loop {
+            if unsafe { libc::flock(self.allocation_lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(io_code(error, ffi::SQLITE_IOERR_LOCK));
+            }
+        }
+        let lock = AllocationLock(&self.allocation_lock);
+        let expected = match self.allocation_lock.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(ffi::SQLITE_IOERR_LOCK),
+        };
+        let current = match std::fs::symlink_metadata(&self.lock_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return Err(ffi::SQLITE_IOERR_LOCK),
+        };
+        if current.dev() != expected.dev() || current.ino() != expected.ino() || !current.is_dir() {
+            return Err(ffi::SQLITE_IOERR_LOCK);
+        }
+        if self
+            .allocation_lock
+            .set_modified(std::time::SystemTime::now())
+            .is_err()
+        {
+            return Err(ffi::SQLITE_IOERR_LOCK);
+        }
+
+        Ok(lock)
+    }
+
+    fn available_after_headroom(&self) -> Result<u64, c_int> {
+        let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(self.directory.as_raw_fd(), space.as_mut_ptr()) } != 0 {
+            return Err(ffi::SQLITE_IOERR_FSTAT);
+        }
+        let space = unsafe { space.assume_init() };
+        let Ok(available) = u64::try_from(u128::from(space.f_bavail) * u128::from(space.f_frsize))
+        else {
+            return Err(ffi::SQLITE_FULL);
+        };
+        let mut headroom = self.headroom_bytes;
+        for (directory, name) in &self.checkpoints {
+            let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+            let bytes = match super::wal_checkpoint_reservation_bytes(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(ffi::SQLITE_IOERR_FSTAT),
+            };
+            let Some(updated) = headroom.checked_add(bytes) else {
+                return Err(ffi::SQLITE_FULL);
+            };
+            headroom = updated;
+        }
+        available.checked_sub(headroom).ok_or(ffi::SQLITE_FULL)
+    }
+}
+
 impl DiskFile {
+    // Keep rounded data reservations and actual extent-tree blocks charged.
+    // On refusal, release only unused tail extents: SQL rollback still needs
+    // every byte up to the current logical EOF. Cleanup never changes refusal
+    // into success, and any retained excess remains charged until close/retry.
+    fn reconcile(&mut self, total: &mut u64) -> c_int {
+        let state = unsafe { &*self.state };
+        let measure = |disk: &mut Self, total: &mut u64| -> Result<u64, c_int> {
+            let metadata = disk.file.metadata().map_err(|_| ffi::SQLITE_IOERR_FSTAT)?;
+            let blocks = metadata.blocks().checked_mul(512).ok_or(ffi::SQLITE_FULL)?;
+            let charged = blocks.max(disk.allocated.div_ceil(CHUNK) * CHUNK);
+            *total = total.saturating_sub(disk.charged).saturating_add(charged);
+            disk.charged = charged;
+            disk.physical_bytes = blocks;
+            Ok(metadata.len())
+        };
+        let previous_physical = self.physical_bytes;
+        let length = match measure(self, total) {
+            Ok(length) => length,
+            Err(code) => return code,
+        };
+        if self.physical_bytes == 0 {
+            self.headroom_pending = false;
+        }
+        let headroom_exceeded = if self.physical_bytes > previous_physical || self.headroom_pending
+        {
+            // A failed measurement or refusal must be rechecked on retry,
+            // even when the already-written metadata does not grow again.
+            self.headroom_pending = true;
+            match state.available_after_headroom() {
+                Ok(_) => {
+                    self.headroom_pending = false;
+                    false
+                }
+                Err(ffi::SQLITE_FULL) => true,
+                Err(code) => return code,
+            }
+        } else {
+            false
+        };
+        if *total <= state.max_physical_bytes && !headroom_exceeded {
+            return ffi::SQLITE_OK;
+        }
+        self.headroom_pending = true;
+        let trimmed = self.file.set_len(length);
+        if trimmed.is_ok() {
+            self.allocated = length;
+        }
+        let measured = measure(self, total);
+        if let Err(error) = trimmed {
+            return io_code(error, ffi::SQLITE_IOERR_TRUNCATE);
+        }
+        if let Err(code) = measured {
+            return code;
+        }
+        ffi::SQLITE_FULL
+    }
+
+    fn refresh(&mut self) -> c_int {
+        let state = unsafe { &*self.state };
+        let Ok(mut total) = state.allocated_bytes.lock() else {
+            return ffi::SQLITE_IOERR;
+        };
+        let _lock = match state.allocation_guard() {
+            Ok(lock) => lock,
+            Err(code) => return code,
+        };
+        self.reconcile(&mut total)
+    }
+
     fn allocate(&mut self, end: u64) -> c_int {
         let state = unsafe { &*self.state };
         if state
@@ -287,6 +418,10 @@ impl DiskFile {
             .is_some_and(|lease| lease.check(state.max_physical_bytes).is_err())
         {
             return ffi::SQLITE_IOERR_WRITE;
+        }
+        let refreshed = self.refresh();
+        if refreshed != ffi::SQLITE_OK {
+            return refreshed;
         }
         if end <= self.allocated {
             return ffi::SQLITE_OK;
@@ -306,63 +441,21 @@ impl DiskFile {
             return ffi::SQLITE_IOERR;
         };
         let increase = new_size - self.allocated;
-        let Some(new_total) = total.checked_add(new_size - self.charged) else {
+        let Some(new_total) = total.checked_add(new_size.saturating_sub(self.charged)) else {
             return ffi::SQLITE_FULL;
         };
         if new_total > state.max_physical_bytes {
             return ffi::SQLITE_FULL;
         }
-        loop {
-            if unsafe { libc::flock(state.allocation_lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return io_code(error, ffi::SQLITE_IOERR_LOCK);
-            }
-        }
-        let _lock = AllocationLock(&state.allocation_lock);
-        let expected = match state.allocation_lock.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => return ffi::SQLITE_IOERR_LOCK,
+        let _lock = match state.allocation_guard() {
+            Ok(lock) => lock,
+            Err(code) => return code,
         };
-        let current = match std::fs::symlink_metadata(&state.lock_path) {
-            Ok(metadata) => metadata,
-            Err(_) => return ffi::SQLITE_IOERR_LOCK,
+        let available = match state.available_after_headroom() {
+            Ok(available) => available,
+            Err(code) => return code,
         };
-        if current.dev() != expected.dev() || current.ino() != expected.ino() || !current.is_dir() {
-            return ffi::SQLITE_IOERR_LOCK;
-        }
-        if state
-            .allocation_lock
-            .set_modified(std::time::SystemTime::now())
-            .is_err()
-        {
-            return ffi::SQLITE_IOERR_LOCK;
-        }
-
-        let mut space = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::fstatvfs(state.directory.as_raw_fd(), space.as_mut_ptr()) } != 0 {
-            return ffi::SQLITE_IOERR_FSTAT;
-        }
-        let space = unsafe { space.assume_init() };
-        let Ok(available) = u64::try_from(u128::from(space.f_bavail) * u128::from(space.f_frsize))
-        else {
-            return ffi::SQLITE_FULL;
-        };
-        let mut headroom = state.headroom_bytes;
-        for (directory, name) in &state.checkpoints {
-            let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
-            let bytes = match super::wal_checkpoint_reservation_bytes(&path) {
-                Ok(bytes) => bytes,
-                Err(_) => return ffi::SQLITE_IOERR_FSTAT,
-            };
-            let Some(updated) = headroom.checked_add(bytes) else {
-                return ffi::SQLITE_FULL;
-            };
-            headroom = updated;
-        }
-        if increase > available.saturating_sub(headroom) {
+        if increase > available {
             return ffi::SQLITE_FULL;
         }
         // Allocate real extents without increasing logical EOF. Concurrent jobs
@@ -382,13 +475,16 @@ impl DiskFile {
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return io_code(error, ffi::SQLITE_IOERR_WRITE);
+                let refreshed = self.reconcile(&mut total);
+                return if refreshed == ffi::SQLITE_OK {
+                    io_code(error, ffi::SQLITE_IOERR_WRITE)
+                } else {
+                    refreshed
+                };
             }
         }
         self.allocated = new_size;
-        self.charged = new_size;
-        *total = new_total;
-        ffi::SQLITE_OK
+        self.reconcile(&mut total)
     }
 }
 
@@ -439,6 +535,8 @@ unsafe extern "C" fn open(
                     state,
                     allocated: 0,
                     charged: 0,
+                    physical_bytes: 0,
+                    headroom_pending: false,
                 })),
             },
         );
@@ -527,7 +625,12 @@ unsafe extern "C" fn write(
             return result;
         }
         let bytes = std::slice::from_raw_parts(input.cast::<u8>(), amount as usize);
-        match disk.file.write_all_at(bytes, offset as u64) {
+        let written = disk.file.write_all_at(bytes, offset as u64);
+        let refreshed = disk.refresh();
+        if refreshed != ffi::SQLITE_OK {
+            return refreshed;
+        }
+        match written {
             Ok(()) => ffi::SQLITE_OK,
             Err(error) => io_code(error, ffi::SQLITE_IOERR_WRITE),
         }
@@ -542,33 +645,32 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int 
         let Some(disk) = (&mut *file.cast::<SqlFile>()).disk.as_mut() else {
             return ffi::SQLITE_IOERR_TRUNCATE;
         };
-        let result = disk.allocate(size as u64);
-        if result != ffi::SQLITE_OK {
-            return result;
+        if size as u64 > disk.allocated {
+            let result = disk.allocate(size as u64);
+            if result != ffi::SQLITE_OK {
+                return result;
+            }
         }
         if let Err(error) = disk.file.set_len(size as u64) {
             return io_code(error, ffi::SQLITE_IOERR_TRUNCATE);
         }
-        // Truncation frees the unused reservation beyond EOF. Charge the final
-        // filesystem block conservatively; subsequent growth reallocates it.
-        let retained = (size as u64).div_ceil(CHUNK) * CHUNK;
-        let state = &*disk.state;
-        let Ok(mut total) = state.allocated_bytes.lock() else {
-            return ffi::SQLITE_IOERR;
-        };
-        *total = total.saturating_sub(disk.charged.saturating_sub(retained));
+        // Truncation frees tail extents, but extent metadata may remain.
         disk.allocated = size as u64;
-        disk.charged = retained;
-        ffi::SQLITE_OK
+        disk.refresh()
     })
 }
 
 unsafe extern "C" fn sync(file: *mut ffi::sqlite3_file, _: c_int) -> c_int {
     protect(|| unsafe {
-        let Some(disk) = (&*file.cast::<SqlFile>()).disk.as_ref() else {
+        let Some(disk) = (&mut *file.cast::<SqlFile>()).disk.as_mut() else {
             return ffi::SQLITE_IOERR_FSYNC;
         };
-        match disk.file.sync_data() {
+        let synced = disk.file.sync_data();
+        let refreshed = disk.refresh();
+        if refreshed != ffi::SQLITE_OK {
+            return refreshed;
+        }
+        match synced {
             Ok(()) => ffi::SQLITE_OK,
             Err(error) => io_code(error, ffi::SQLITE_IOERR_FSYNC),
         }
@@ -659,6 +761,9 @@ static METHODS: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     xFetch: None,
     xUnfetch: None,
 };
+
+#[cfg(test)]
+mod extent_tests;
 
 #[cfg(test)]
 mod tests {

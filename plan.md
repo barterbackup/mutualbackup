@@ -7650,3 +7650,41 @@ reservations, policy/reboot/adoption lifecycle and normal paged production remai
 open. Require fresh installed-binary evidence for this changed bridge before
 release qualification. Keep R1/R2/R3/R5/R7/M6 and deferred dense/native-platform
 requirements open; normal paged producers remain disabled.
+
+
+### 2026-10-27 — Account for scratch extent metadata and retry debt
+
+Disposable Linux scratch now charges the larger of each file's rounded data
+reservation and reported allocated blocks, including ext4 extent-tree blocks,
+across the whole job. Allocation, write and sync callbacks remeasure usage under
+the shared allocation lock. Refusal reclaims only preallocation beyond logical EOF and
+retains every visible byte and any remaining allocation charge. Metadata growth
+also rechecks filesystem/checkpoint headroom; unresolved headroom checks survive
+retries and measurement errors. Truncation/close releases the proper charge, and
+partial truncation/regrowth handles metadata charges exceeding rounded data.
+
+Two initial baselines admitted 528,384 physical bytes against a 524,288-byte
+ceiling. A later headroom regression caught a refused metadata write becoming
+writable on immediate retry without releasing space. Five corrected ext4 cases
+prove refusal/cleanup, exact bytes, ordinary retry, fitting metadata across files,
+partial regrowth, repeated refusal and restored-headroom recovery. A probe's
+incorrect inferred buffer type was corrected without changing payload lengths.
+All four failed fixtures and their read-only copies remain unchanged, with source
+and executable snapshots retained.
+
+The final frozen Store passes 658 cases, 32 ignored, in 766.40 seconds under
+the original 900-second/four-worker/65,536-FD gate. All 108 volume cases pass,
+eight ignored; owned Btrfs passes native scratch headroom/refusal/retry, five
+ordinary scratch lifecycle cases and the provisioned rewrite/rollback case.
+Seven focused scratch VFS tests, strict locked workspace/all-targets Clippy,
+formatting and diff checks pass. All successful native images, mounts and loop
+attachments are removed. Final 473-input/source/executable audit and logs:
+`/tmp/mb-scratch-extent-headroom-qualification`; initial baseline, buffer probe
+and first qualification: `/tmp/mb-scratch-extent-qualification`.
+
+This is a prerequisite for physical scratch funding, not that complete contract.
+Durable scratch declarations still reserve logical ceilings; full physical
+backing, unreported filesystem metadata, cross-producer/volume reservations,
+policy/reboot/adoption lifecycle and normal paged production remain open. Keep
+R1/R2/R3/R5/R7/M6, current installed-artifact qualification and unchanged deferred
+dense/native-platform requirements open. Normal paged producers remain disabled.

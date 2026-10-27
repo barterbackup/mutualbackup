@@ -31,6 +31,18 @@ Checkpoint contention can return SQLite's normal busy error; retry after the
 checkpoint completes. These checks apply to new commits and do not adopt old
 unfunded WAL debt or replace the enclosing resource reservation policy.
 
+Linux disposable scratch budgets cover rounded data reservations and reported
+allocated blocks across every database and journal in the job. This includes
+ext4 extent-tree blocks, which can grow during allocation or writes. The runtime
+checks block usage after allocation, writes and syncs. An operation
+that exceeds its budget fails and releases only unused reservations beyond EOF;
+visible bytes remain available for rollback. Any excess that cannot be reclaimed
+remains charged until truncation or close.
+Headroom refusals remain pending across retries until space can be revalidated
+or the file releases all its blocks. This accounting does not physically
+fund unreported filesystem metadata or the complete scratch ceiling when a job
+is declared; that shared admission contract remains unfinished.
+
 Initialize the public identity and keep its recovery string outside the data
 directory, then create native catalogs while the daemon is stopped:
 

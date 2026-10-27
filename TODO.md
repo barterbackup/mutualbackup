@@ -3326,6 +3326,40 @@ before installed qualification; this standalone target does not close R7 or M6.
       scratch ledgers do not establish this complete shared policy. Bind it to
       ordinary producers and restart/retirement before enabling normal paged
       backup; retain the required single-owner 1 TiB geometry and history target.
+      - [x] Charge reported scratch extent metadata and retain headroom refusals.
+        Scratch allocation charged requested rounded data bytes without checking
+        filesystem blocks after allocation, writes or syncs. Both ext4 baseline
+        cases accepted 528,384 bytes against a 524,288-byte ceiling when a fifth
+        extent needed a metadata block. Each file now charges the larger of its
+        rounded data reservation and reported blocks, and the job sums those
+        charges. Growth rechecks shared filesystem/checkpoint headroom. Refusal
+        trims only unused reservations beyond EOF, preserves visible bytes and
+        keeps retained allocation charged. A separate regression caught retries
+        forgetting a failed headroom check when EOF left no reclaimable tail;
+        unresolved checks now remain pending through retries and measurement
+        errors until headroom is validated or the file frees all its blocks.
+        Partial truncation/regrowth avoids unsigned subtraction of a larger
+        metadata charge from a smaller data reservation; shrinking/closing files
+        update their charge without erasing another file's usage.
+        Five ext4 regressions cover allocation/write refusal, exact visible-byte
+        preservation and healthy retry, fitting metadata across two files,
+        partial truncation and repeated headroom refusal/restored-space retry.
+        Final frozen Store passes 658 with 32 ignored in 766.40 seconds
+        under the original 900-second/four-worker/65,536-FD gate. All 108 volume
+        cases pass (eight ignored); Btrfs passes the native scratch headroom
+        workflow, five ordinary scratch lifecycle cases and the separately
+        provisioned rewrite/rollback case. Seven focused scratch VFS cases,
+        strict locked workspace/all-targets Clippy, formatting and diff checks
+        pass. Four failed fixture originals/read-only copies, source archives
+        and executables remain unchanged, including a corrected fixture buffer
+        type and the interim headroom-retry failure. Evidence and final 473-input
+        freeze: `/tmp/mb-scratch-extent-headroom-qualification`; initial baselines
+        and prior qualification: `/tmp/mb-scratch-extent-qualification`.
+        This closes reported-block undercharging; it does not physically fund
+        full job declarations, unreported filesystem metadata or complete
+        durable cross-producer/volume reservations. Shared policy/lifecycle,
+        normal paged production and R1/R2/R3/R5/R7/M6 remain open, including the
+        unchanged deferred dense 1 TiB/native-platform requirements.
       - [x] Fund native main data before publishing a WAL commit.
         A native WAL could commit a database larger than its immutable main
         ceiling, or commit while readers blocked checkpointing with only 65,536
