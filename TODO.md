@@ -240,6 +240,24 @@ applied. Evidence: `/tmp/mb-sqlcipher-dev-optimization-12g42g38`. Keep the timeo
 cause, complete-source prerequisite and corrected installed qualification open;
 do not relax workloads, encryption/durability settings, assertions or deadlines.
 
+Further diagnosis identifies development-build Curve25519 arithmetic as a large
+CPU cost in four slow Store cases: 8,258 user-space samples have no lost samples,
+with at least 59.57% in Curve25519/vector-arithmetic symbols. This does not
+attribute the whole-suite wall time or retrospectively explain every timeout.
+Evidence: `/tmp/mb-store-cpu-profile-by6juxwv`. The targeted development profile
+now optimizes only `curve25519-dalek`, explicitly retaining debug assertions and
+overflow checks. Application optimization, cryptographic backend/features and
+the SQLCipher object remain unchanged. Four identical cases pass all 16 A/B/B/A
+executions, with mean wall time falling from 66.99 to 29.76 seconds. The complete
+candidate Store target then passes all 640 ordinary cases (32 ignored) in 700.20
+seconds under the original 900-second bound, four workers and descriptor limit.
+This includes the six ext4 overcharge regressions and query-only cipher guards.
+`audit.json` under `/tmp/mb-curve25519-dev-optimization-oxxshrpc` binds source,
+executables, backend/feature/profile invariants and exact case identities.
+Encryption parameters, validation work, durability, payloads and acceptance
+deadlines are unchanged. Run a fresh complete workspace/native prerequisite
+before installed qualification; this standalone target does not close R7 or M6.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git

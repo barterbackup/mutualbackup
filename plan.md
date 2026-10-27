@@ -7359,3 +7359,28 @@ acceptance scope. Workloads, encryption, durability, assertions, four workers
 and the original deadlines remain unchanged. Complete-source and installed
 qualification, the historical failures and the enclosing M6 requirements stay
 open; normal paged producers remain disabled.
+
+### 2026-10-27 — Optimize development signature arithmetic with checks retained
+
+CPU sampling of four unchanged slow Store cases produces 8,258 samples without
+loss. At least 59.57% of the samples land in Curve25519/vector-arithmetic symbols;
+this is a CPU diagnosis for those cases, not whole-suite wall-time attribution.
+Evidence: `/tmp/mb-store-cpu-profile-by6juxwv`. The SQLite optimization experiment
+above remains rejected. A separate controlled trial optimizes only the
+`curve25519-dalek` development package, preserving its backend/features, Rust
+debug assertions and overflow checks, the application profile and byte-identical
+SQLCipher object. All 16 A/B/B/A executions pass the same four cases, with mean
+wall time falling from 66.99 to 29.76 seconds.
+
+The complete candidate Store target passes all 640 ordinary cases in 700.20
+seconds with 32 ignored, under the unchanged 900-second bound, four workers and
+65,536-descriptor limit. Exact case identities, source and executable hashes,
+profiles, backend flags, timings and direct-child resource accounting are
+verified under `/tmp/mb-curve25519-dev-optimization-oxxshrpc`. Its recorded maximum
+RSS is 149,468 KiB, including descendants reaped by Store. The root Cargo profile
+now applies the measured optimization with explicit debug/overflow checks;
+cryptographic algorithms, validation work, encryption parameters, durability,
+payloads and deadlines are unchanged. Keep the original negatives and incomplete
+source attempts as historical evidence. Require fresh complete workspace,
+provisioned/bulk and installed-artifact qualification before closing R7; this
+standalone target does not close M6 or enable normal paged producers.

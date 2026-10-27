@@ -75,6 +75,12 @@ x25519-dalek = { version = "2.0", features = ["serde", "static_secrets"] }
 zeroize = { version = "1.8", features = ["derive"] }
 zxcvbn = { version = "=3.1.1", default-features = false }
 
+# Optimize the vector arithmetic used by signature validation in dev/test builds.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
