@@ -56,6 +56,37 @@ pub struct GitCatalogRoot {
 }
 
 impl GitCatalogRoot {
+    /// Complete unique-graph validation storage, before fetching its streams.
+    /// This does not cover import's expanded HEAD namespace or blob capture.
+    pub fn graph_scratch_storage_limits(
+        &self,
+    ) -> Result<mb_store::ScratchStorageLimits, CatalogStoreError> {
+        self.validate()?;
+        // Each tree/commit/tag edge contains at least one 20-byte object ID
+        // in the original raw metadata. DFS visits each node/edge once; eight
+        // mutations per node/edge/ref cover build, names, symlinks and frames.
+        let items = u128::from(self.objects.objects)
+            + u128::from(self.blobs.blobs)
+            + u128::from(self.refs.records.records)
+            + u128::from(self.objects.object_bytes / 20);
+        let mutations = 32 + 8 * items;
+        // Fixed node/frame/edge fields fit 256 bytes. Encoded edge names use
+        // at most two CBOR bytes per raw byte; all names occur in object bytes.
+        let values = mutations * 256 + 2 * u128::from(self.objects.object_bytes);
+        // Node, edge, DFS and symlink keys plus kind fit 64 bytes. A tree-name
+        // key adds its raw component once; all components occur in object_bytes.
+        // Ref names are validated directly and do not become graph-index keys.
+        let key_bytes = 64 * mutations + u128::from(self.objects.object_bytes);
+        Ok(
+            mb_store::ScratchStorageLimits::for_record_writes_with_key_bytes(
+                values.min(u128::from(u64::MAX)) as u64,
+                mutations.min(u128::from(u64::MAX)) as u64,
+                key_bytes.min(u128::from(u64::MAX)) as u64,
+                CATALOG_MAX_STREAM_BYTES * 4,
+            )?,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), CatalogError> {
         if self.format_version != 1 || self.repository_id.is_nil() {
             return Err(CatalogError::InvalidPage);

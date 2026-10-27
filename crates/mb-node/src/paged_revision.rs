@@ -1,7 +1,7 @@
 //! Owner-encrypted root descriptor for the paged revision migration.
 //! Ordinary capture/replay remain on existing formats until all consumers move.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use mb_core::{
     CATALOG_MAX_PAGE_OCCURRENCES, CATALOG_MAX_STREAM_BYTES, CatalogNativeFileRoot, CatalogScope,
     CatalogSectorRecord, KeyMaterial, PAGED_USER_REVISION_VERSION, PagedUserRevision,
@@ -211,8 +211,14 @@ impl PagedPrivateMetadata {
             fence,
         )?;
         if let Some(git) = &self.git {
-            let scratch =
-                crate::volume::paged_scratch_store(control, mb_core::CATALOG_MAX_STREAM_BYTES * 4)?;
+            let limits = git.graph_scratch_storage_limits()?;
+            let scratch = crate::volume::paged_scratch_store(control, limits.max_database_bytes)
+                .with_context(|| {
+                    format!(
+                        "fund Git graph validation scratch ({} database bytes, {} physical bytes)",
+                        limits.max_database_bytes, limits.max_physical_bytes
+                    )
+                })?;
             git.validate_graph_with_scratch(bundle.scope, &scratch, |page| {
                 Ok(control.catalog_page(bundle.scope, mb_core::CatalogSection::GitGraph, page)?)
             })?;

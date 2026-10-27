@@ -19,6 +19,66 @@ pub struct ScratchStorageLimits {
 }
 
 impl ScratchStorageLimits {
+    /// Bound writes to a fresh fixed protocol_records table and its unique index.
+    /// Count cumulative value bytes and mutations (including replacements),
+    /// not just the final live rows. `key_kind_bytes` bounds both key columns.
+    /// The caller's existing database ceiling remains an independent hard cap.
+    pub fn for_record_writes(
+        value_bytes: u64,
+        mutations: u64,
+        key_kind_bytes: u32,
+        database_ceiling: u64,
+    ) -> Result<Self, DatabaseError> {
+        Self::record_write_limits(
+            value_bytes,
+            mutations,
+            u128::from(mutations) * u128::from(key_kind_bytes),
+            database_ceiling,
+        )
+    }
+
+    /// As `for_record_writes`, with a cumulative bound on kind/key bytes across
+    /// all mutations. This avoids charging every short key as the largest key
+    /// when an authenticated stream bounds their aggregate encoded length.
+    pub fn for_record_writes_with_key_bytes(
+        value_bytes: u64,
+        mutations: u64,
+        key_kind_bytes: u64,
+        database_ceiling: u64,
+    ) -> Result<Self, DatabaseError> {
+        Self::record_write_limits(
+            value_bytes,
+            mutations,
+            u128::from(key_kind_bytes),
+            database_ceiling,
+        )
+    }
+
+    fn record_write_limits(
+        value_bytes: u64,
+        mutations: u64,
+        key_kind_bytes: u128,
+        database_ceiling: u64,
+    ) -> Result<Self, DatabaseError> {
+        // The pinned engine has two B-trees, depth <=20, and at most NB+2=5
+        // pages per balancing level. 256 pages cover their transient balancing
+        // and schema/root pages. Eight pages per mutation cover live tree
+        // nodes and overflow rounding. Count duplicated keys, rowids/headers,
+        // and conservatively only 512 payload bytes per 4096-byte cipher page
+        // (even the maximum one-byte SQLite reserve leaves >3800 usable bytes).
+        // Freelist reuse bounds high-water allocation by live plus transient
+        // pages; cumulative replacements also include old/new overflow payloads.
+        let mutations = u128::from(mutations);
+        let payload = u128::from(value_bytes) + 2 * key_kind_bytes + 128 * mutations;
+        let pages = 256 + 8 * mutations + payload.div_ceil(512);
+        let bytes = (pages * 4096).min(u128::from(database_ceiling));
+        let pages = bytes / 4096;
+        if !(16..=u128::from(u32::MAX) - 1).contains(&pages) {
+            return Err(DatabaseError::ScratchUnavailable);
+        }
+        Self::for_database(bytes as u64)
+    }
+
     pub fn for_database(max_database_bytes: u64) -> Result<Self, DatabaseError> {
         Ok(Self {
             max_database_bytes,
@@ -302,6 +362,9 @@ impl RecordScratchStore {
         self.records.database_shell_statement(sql, query_only)
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod geometry_tests;
 
 #[cfg(test)]
 mod tests {

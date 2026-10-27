@@ -3382,6 +3382,36 @@ before installed qualification; this standalone target does not close R7 or M6.
         substitute a small fixture cap to make funding pass. The large ordinary
         Node resource-chain cases and full installed pipeline remain unqualified
         on this new backend; their existing declarations were not changed.
+        - [x] Derive publication's unique Git graph scratch declaration from
+          authenticated object/blob/ref counts and complete raw object bytes.
+          Count cumulative mutations, encoded values and kind/key bytes, then
+          include conservative SQLite tree/overflow/balancing overhead under
+          the original independent 64 GiB database ceiling and unchanged VFS
+          physical policy. Ref names do not become graph-index keys; tree-name
+          bytes are bounded by the raw tree stream. The first draft charged
+          every key at the maximum ref length and requested 13,392,199,680
+          physical bytes for the original small chain fixture; the owned 8 GiB
+          Btrfs run refused before publication. Cumulative key accounting now
+          passes that publication point without changing its data or policies.
+          Four geometry regressions cover wide/mixed keys, overflow values,
+          replacement/deletion/reinsert, arithmetic bounds and both pinned
+          engines' balancing/depth assumptions. Graph fixtures use the derived
+          ceiling, including shared DAGs and metadata above the flat limit.
+          The frozen ordinary Git suite passes 131 cases with 66 ignored in
+          232.22 seconds; the four geometry cases pass in 0.48 seconds.
+          Strict locked workspace/all-target Clippy, format and diff checks
+          pass. Frozen worktree sources, executables and run logs are in
+          `/tmp/mb-scratch-plan-qualification/aggregate`; baseline and interim
+          failed images have verified read-only copies. The worktree includes
+          unfinished history/body/restore/stack sizing experiments; complete
+          operation and installed qualification remain open.
+        - [ ] Preflight Git import's complete expanded HEAD namespace before
+          recovering blobs or creating output. Unique graph counts alone do
+          not bound the number of expanded paths through a shared-tree DAG.
+          Count complete pending metadata/ref/index rows and bounded blob
+          anchors, preserve the validated graph across admission, and fund
+          simultaneous graph/staging/native/proof lifetimes. Keep the full
+          ordinary recovery assertions, work limits and signed payloads.
       - [x] Charge reported scratch extent metadata and retain headroom refusals.
         Scratch allocation charged requested rounded data bytes without checking
         filesystem blocks after allocation, writes or syncs. Both ext4 baseline

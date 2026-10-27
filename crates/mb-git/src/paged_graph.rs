@@ -991,7 +991,9 @@ mod tests {
     }
 
     fn verify(root: &GitCatalogRoot, pages: &Pages) -> Result<()> {
-        root.validate_graph(scope(), |page| {
+        let limits = root.graph_scratch_storage_limits()?;
+        let scratch = RecordScratchStore::new(limits.max_database_bytes)?;
+        root.validate_graph_with_scratch(scope(), &scratch, |page| {
             pages
                 .get(&page.hash)
                 .cloned()
