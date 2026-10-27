@@ -175,6 +175,24 @@ corrections from the 2026-10-26 review are now addressed. A fresh complete-sourc
 prerequisite and corrected packaged musl qualification remain next; the focused
 results do not close R1/R2/R3/R5/R7 or diagnose the separate historical stalls.
 
+Qualification follow-up on 2026-10-27: the complete-source run on `3158ac1`
+passed its preliminary checks and nine targets (387 cases), then Store timed
+out at the unchanged 900-second bound after 552 successes. Node, supplemental
+and installed jobs did not start. An isolated run of the exact frozen Store
+executable completed in 890.15 seconds: 633 passed, one failed, 32 ignored.
+`late_native_extent_exhaustion_rolls_back_the_complete_sql_transaction` retained
+the original record and rejected the oversized transaction, but its subsequent
+allocation accounting returned `CapacityExceeded`. The original failure fixture
+was removed during panic unwinding; the separate timeout's four surviving
+fixture candidates are preserved. Evidence is under
+`/tmp/mb-post-routing-full-qual-wd__xz5y`. Failure-only fixture preservation and
+per-file allocation logging are now added to that test. Its unchanged physical
+cohort passes 21 diagnostic runs (19 cases each) against the frozen dependencies
+under `/tmp/mb-native-extent-rollback-uwm1fnw9`; these passes do not explain or
+close the full-run failure. Production allocation, budgets, payloads, assertions
+and acceptance deadlines remain unchanged. Diagnose this failure before rerunning
+the complete prerequisite or starting installed qualification.
+
 - [ ] **R1 / P1 — Remove the FUSE-backed guarded product and define safe upgrade
   behavior.** Inventory guarded/FUSE store modules, dependencies, mount and
   supervision code, daemon startup/replay hooks, root enrollment/removal and Git

@@ -7270,3 +7270,28 @@ a fresh complete-source prerequisite before corrected packaged musl/runtime
 qualification. R1/R2/R3/R5/R7, the historical native/relay timeout investigations,
 normal paged integration and the deferred hardware/platform requirements remain
 open; this focused pass does not close them or enable paged producers.
+
+### 2026-10-27 — Preserve native extent rollback failure evidence
+
+The post-routing full gate on `3158ac1` passed format, packaging harness checks,
+strict workspace Clippy and the locked all-target build. Nine ordinary targets
+passed 387 cases before Store exceeded its original 900-second bound with 552
+recorded successes. Its isolated frozen executable subsequently completed in
+890.15 seconds with 633 passes and one failure: native extent exhaustion rolled
+back the SQL transaction and preserved the original data, but the following
+allocation-accounting call returned `CapacityExceeded`. The failure's original
+temporary directory was removed on unwind. Four candidates from the distinct
+timeout are preserved with read-only copies; they are not attributed to this
+failed case. Source, executable and negative-run audits are retained under
+`/tmp/mb-post-routing-full-qual-wd__xz5y`.
+
+The regression now retains its fixture on panic after the connection closes and
+logs each tracked file's role, length, allocated bytes and open count when the
+accounting call fails. Production allocation and the original test's limits,
+payload, assertions and retry remain unchanged. One initial and 20 repeated
+physical-I/O cohort runs pass against the original frozen dependency libraries
+(19 passed and two ignored per run), with evidence under
+`/tmp/mb-native-extent-rollback-uwm1fnw9`. These are diagnostic positives, not a
+resolution of the full-run failure or timeout. Complete-source qualification
+and corrected installed musl/runtime qualification remain open; no installed
+build or runtime has started.

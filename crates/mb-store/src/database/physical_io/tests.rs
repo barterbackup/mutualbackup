@@ -331,13 +331,25 @@ fn native_runtime_allocates_main_wal_and_shm_without_extending_to_their_ceiling(
 
 #[test]
 fn late_native_extent_exhaustion_rolls_back_the_complete_sql_transaction() {
+    struct PreserveFailure(Option<tempfile::TempDir>);
+    impl Drop for PreserveFailure {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let path = self.0.take().unwrap().keep();
+                eprintln!("NATIVE_EXTENT_NEGATIVE_FIXTURE {}", path.display());
+            }
+        }
+    }
     let mut budget = limits();
     budget.main_bytes = 512 * 1024;
     budget.journal_bytes = 512 * 1024;
     budget.shm_bytes = CHUNK;
     budget.total_bytes = 2 << 20;
     budget.temporary_bytes = 512 * 1024;
-    let (_temp, store) = setup(budget);
+    let prepared = setup(budget);
+    // Drop the connection before retaining or removing its directory.
+    let _fixture = PreserveFailure(Some(prepared.0));
+    let store = prepared.1;
     store
         .put_record("physical", b"preserve", b"committed")
         .unwrap();
@@ -356,7 +368,21 @@ fn late_native_extent_exhaustion_rolls_back_the_complete_sql_transaction() {
         Some(b"committed".to_vec())
     );
     assert_eq!(store.get_record("physical", b"over-limit").unwrap(), None);
-    assert!(store.physical_io_allocated_bytes().unwrap().unwrap() <= budget.total_bytes);
+    let charged = store.physical_io_allocated_bytes();
+    if charged.is_err() {
+        let pool = &store.physical_vfs.as_ref().unwrap().pool;
+        for entry in pool.files.lock().unwrap().values() {
+            let metadata = entry.pin.metadata().unwrap();
+            eprintln!(
+                "NATIVE_EXTENT_USAGE_FAILURE role={:?} length={} allocated={} open={}",
+                entry.role,
+                metadata.len(),
+                metadata.blocks() * 512,
+                entry.open
+            );
+        }
+    }
+    assert!(charged.unwrap().unwrap() <= budget.total_bytes);
     store
         .put_record("physical", b"retry", b"small successful retry")
         .unwrap();
